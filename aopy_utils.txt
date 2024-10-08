@@ -1,0 +1,204 @@
+exp_data, exp_metadata = aopy.data.load_preproc_exp_data(data_path_preproc, subject, entry.id, entry.date)
+
+ap_data = aopy.data.load_hdf_group(os.path.join(data_path_preproc, subject), filename_mc, 'ap')
+ap_metadata = aopy.data.load_hdf_group(os.path.join(data_path_preproc, subject), filename_mc, 'metadata')
+
+ap_data['unique_label'] # electrode positions
+
+
+binned_spikes, time_bins = aopy.precondition.bin_spike_times(ap_data['unit'][str(unitid)], 0, np.array(df['reach_end_time'][df['te_id']==entry.id])[-1]+20, bin_width = 0.005) # 20ms bins
+# Align trial segments to delay start
+spike_segs_day[str(unitid)] = aopy.preproc.base.get_data_segments(binned_spikes, traj_times, 1/bin_width)
+
+
+For the self-supervised training of the LFADS model, we need to have a sequence of offline spike data. The data flow is as follows:
+
+file location -> extract ap_data -> bin spikes -> spike data
+
+1. ap_data = aopy.data.load_hdf_group(os.path.join(data_path_preproc, subject), filename_mc, 'ap')
+2. binned_spikes, time_bins = aopy.precondition.bin_spike_times(ap_data['unit'][str(unitid)], 0, np.array(df['reach_end_time'][df['te_id']==entry.id])[-1]+20, bin_width = 0.005) # 20ms bins
+3. spike_segs_day[str(unitid)] = aopy.preproc.base.get_data_segments(binned_spikes, traj_times, 1/bin_width)
+
+
+What's the output of the real-time data stream? Is it a action potential data or spike time data (need to confirm it from Rajeev)
+
+Assume the output is a action potential data, then we need figure out the functions and rewrite it in C++.
+
+I guess the dataflow will be 
+
+file location -> extract ap_data -> downsample -> detect spikes by using threshold and bin size -> bin spikes -> spike rate data
+
+samplerate_dwns = 10000
+
+raw_ap_data, raw_ap_metadata = aopy.data.neuropixel.load_neuropixel_data(data_path_raw, data_folder_mc, 'ap')
+apdata_dwns = aopy.precondition.base.downsample(raw_ap_data.samples, int(raw_ap_metadata['sample_rate']), samplerate_dwns)
+
+
+# aopy.data.neuropixel.load_neuropixel_data.py
+def load_neuropixel_data(data_dir, data_folder, datatype, node_idx=0, ex_idx=0, port_number=1):
+    '''
+    Load neuropixel data object and metadata. The data obeject has 4 properties of samples, sample_numbers, timestamps, and metadata.
+    See this link: https://github.com/open-ephys/open-ephys-python-tools/tree/main/src/open_ephys/analysis
+    
+    Args:
+        data_dir (str): data directory where the data files are located
+        data_folder (str): data folder where 1 experiment data is saved
+        datatype (str): datatype. 'ap' or 'lfp'
+        node_idx (int): record node index. This is usually 0.
+        ex_idx (int): experiment index. This is usually 0.
+        port_number (int): port number which a probe connected to. natural number from 1 to 4. 
+    
+    Returns:
+        tuple: Tuple containing:
+            | **rawdata (object):** data object
+            | **metadata (dict):** metadata
+    '''
+    
+    if datatype == 'ap':
+        datatype_idx = 2*(port_number-1) # even numbers correspond to action potential
+    elif datatype == 'lfp':
+        datatype_idx = 2*port_number-1 # odd numbers correspond to lfp
+    else:
+        raise ValueError(f"Unknown datatype {datatype}")
+    
+    # Load data and metadata
+    data_path = os.path.join(data_dir, data_folder)
+    session = Session(data_path)
+    data = session.recordnodes[node_idx].recordings[ex_idx].continuous[datatype_idx]   
+    metadata = data.metadata
+    
+    # Add electrode configuration to metadata
+    config = load_neuropixel_configuration(data_dir, data_folder, ex_idx=ex_idx, port_number=port_number)
+    metadata['slot'] = config['slot']
+    metadata['port'] = config['port']
+    metadata['dock'] = config['dock']
+    metadata['channel'] = config['channel']
+    metadata['ch_bank'] = config['ch_bank']
+    metadata['xpos'] = config['xpos']
+    metadata['ypos'] = config['ypos']
+    metadata['referenceChannel'] = config['referenceChannel']
+    metadata['probe_serial_number'] = config['probe_serial_number']
+    metadata['probe_part_number'] = config['probe_part_number']
+    metadata['bs_serial_number'] = config['bs_serial_number']
+    metadata['bs_part_number'] = config['bs_part_number']
+    metadata['bsc_serial_number'] = config['bsc_serial_number']
+    metadata['bsc_part_number'] = config['bsc_part_number']
+    metadata['headstage_serial_number'] = config['headstage_serial_number']
+    metadata['headstage_part_number'] = config['headstage_part_number']
+     
+    if datatype == 'ap':
+        metadata['apGainValue'] = config['apGainValue']
+    else:
+        metadata['lfpGainValue'] = config['lfpGainValue']
+    
+    return data, metadata
+
+
+def downsample(data, old_samplerate, new_samplerate):
+    '''
+    Downsample by averaging. Computes a downsample factor based on old_samplerate/new_samplerate.
+    If the downsample factor is fractional, then first upsamples to the least common multiple of 
+    the two sampling rates. Finally, pads data to be a multiple of the downsample factor and 
+    averages blocks into the new samples. 
+
+    .. image:: _images/downsample.png
+
+    Args:
+        data (nt, ...): timeseries data to be downsampled. Can be 1D or 2D.
+        old_samplerate (int): the current sampling rate of the data
+        new_samplerate (int): the desired sampling rate of the downsampled data
+        
+    Returns:
+        (nt, ...) downsampled data
+    '''
+    assert new_samplerate < old_samplerate, "New sampling rate must be less than old sampling rate"
+    assert int(old_samplerate) == old_samplerate, "Input samplerates must be integers"
+    assert int(new_samplerate) == new_samplerate, "Input samplerates must be integers"
+
+    # Check if the downsample factor will be an integer, otherwise we find a common divisor
+    if old_samplerate % new_samplerate != 0:
+        lcm = np.lcm(int(old_samplerate), int(new_samplerate)) # least common multiple
+        print(f"Upsampling first to {lcm} Hz")
+        upsampled = np.repeat(data, lcm/old_samplerate, axis=0)
+        return downsample(upsampled, lcm, new_samplerate)
+        
+    old_samples = data.shape[0]
+    downsample_factor = int(old_samplerate/new_samplerate)
+
+    # Pad the data to a multiple of the downsample factor
+    pad_size = math.ceil(float(old_samples)/downsample_factor)*downsample_factor - old_samples
+    pad_shape = (pad_size,)
+    if data.ndim > 1:
+        pad_shape = np.concatenate(([pad_size], data.shape[1:]))
+    data_padded = np.append(data, np.zeros(pad_shape)*np.NaN, axis=0)
+
+    # Downsample using average
+    if data.ndim == 1:
+        return np.nanmean(data_padded.reshape(-1, downsample_factor), axis=1)
+    elif data.ndim == 2:
+        downsampled = np.zeros((int(data_padded.shape[0] / downsample_factor), *data.shape[1:]), dtype=data.dtype)
+        for idx in range(data.shape[1]):
+            downsampled[:, idx] = np.nanmean(data_padded[:, idx].reshape(-1, downsample_factor), axis=1)
+        return downsampled
+    elif data.ndim == 3:
+        downsampled = np.zeros((int(data_padded.shape[0] / downsample_factor), *data.shape[1:]), dtype=data.dtype)
+        for idx1 in range(data.shape[1]):
+            for idx2 in range(data.shape[2]):
+                downsampled[:, idx1, idx2] = np.nanmean(data_padded[:, idx1, idx2].reshape(-1, downsample_factor), axis=1)
+        return downsampled
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Assume the output is a spike time data, then we only need to figure out the function: aopy.precondition.bin_spike_times and rewrite it in C++ 
+# aopy.precondition.bin_spike_times.py 
+def bin_spike_times(spike_times, time_before, time_after, bin_width):
+    '''
+    Computes binned spikes (spike rate) [spikes/s]. The input data are 1D spike times in seconds.
+    Binned spikes are calculated at each bin whose width is determined by bin_width. 
+
+    Example:
+        >>> spike_times = np.array([0.0208, 0.0341, 0.0347, 0.0391, 0.0407])
+        >>> spike_times = spike_times.T
+        >>> time_before = 0
+        >>> time_after = 0.05
+        >>> bin_width = 0.01
+        >>> binned_unit_spikes, time_bins = precondition.bin_spike_times(spike_times, time_before, time_after, bin_width)
+        >>> print(binned_unit_spikes)
+            [  0.   0. 100. 200. 100.]
+        >>> print(time_bins)
+            [0.005 0.015 0.025 0.035 0.045]
+
+    Args:
+        spike_times (nspikes): 1D array of spike times [s]
+        time_before (float): start time to easimate spike rate [s]
+        time_after (float): end time to estimate spike rate (Estimation includes endpoint)[s]
+        bin_width (float): width of time-bin to use for estimating spike rate [s]
+
+    Returns:
+        binned_unit_spikes (nbin, nch): spike rate [spikes/s].
+        time_bins : the center of the time-bin over which firing rate is estimated. [s]
+    '''
+
+    time_bins = np.arange(time_before, time_after+bin_width, bin_width) # contain endpoint
+
+    binned_unit_spikes, _ = np.histogram(spike_times, bins=time_bins)
+    binned_unit_spikes = binned_unit_spikes/bin_width # convert [spikes] to [spikes/s]
+
+    time_bins = time_bins[0:-1] + np.diff(time_bins)/2 #change time_bins to be the center of the bin, not the edges.
+
+    return binned_unit_spikes, time_bins
+
