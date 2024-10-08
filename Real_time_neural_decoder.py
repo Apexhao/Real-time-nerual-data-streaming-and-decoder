@@ -6,7 +6,7 @@ This module implements a real-time neural decoder using a pre-trained LFADS mode
 It supports continuous decoding of neural signals with the ability to dynamically
 reset hidden states during experiments.
 
-Author: Hao Fang
+Author: edited by Hao Fang
 Date: 10/8/2014
 Copyright: 2024, The Trustees of University of Washington
 """
